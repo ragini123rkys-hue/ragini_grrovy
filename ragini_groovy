@@ -13,11 +13,16 @@ pipeline {
   }
 
   environment {
-    CONAN_REMOTE = 'liquid'
+    // Conan env variables
+    CONAN_CREDS = credentials('jenkins_liquid_artifactory')
+    CONAN_LOGIN_USERNAME = "$CONAN_CREDS_USR"
+    CONAN_PASSWORD = "$CONAN_CREDS_PSW"
+    CONAN_REMOTE = "liquid"
     CONAN_USER_HOME = "${WORKSPACE}/ConanHome"
   }
 
   stages {
+
     stage('Setup Job Environment') {
       steps {
         script {
@@ -33,15 +38,12 @@ pipeline {
     stage('Agent Debug') {
       steps {
         sh '''#!/bin/bash -e
-          echo "$(hostname)"
-          echo "$(whoami)"
+          hostname && whoami
           echo "PATH: $PATH"
           which python3 && python3 --version || true
           which adb && adb version || true
           echo '--- adb devices ---'
           adb devices || true
-          echo '--- conan version (pre) ---'
-          which conan && conan --version || echo 'conan not found'
         '''
       }
     }
@@ -49,30 +51,14 @@ pipeline {
     stage('Bootstrap Conan') {
       steps {
         sh '''#!/bin/bash -e
-          mkdir -p "${CONAN_USER_HOME}"
-
-          # ensure user-local bin is on PATH for this shell AND export it for later stages
-          export PATH="$HOME/.local/bin:$PATH"
-          echo "Ensuring PATH has ~/.local/bin: $PATH"
-
-          if ! command -v conan >/dev/null 2>&1; then
-            echo "Conan not found. Installing Conan 1.x to user site..."
-            python3 -m pip install --user "conan<2"
-          fi
-
+          command -v conan >/dev/null
           conan --version
+          # Make sure our home is used
+          mkdir -p "${CONAN_USER_HOME}"
+          echo "Using CONAN_USER_HOME=${CONAN_USER_HOME}"
+          conan remote list || true
+          conan user -r "${CONAN_REMOTE}" "${CONAN_LOGIN_USERNAME}" -p "${CONAN_PASSWORD}"
         '''
-        // login using credentials safely (no Groovy interpolation in env)
-        withCredentials([usernamePassword(credentialsId: 'jenkins_liquid_artifactory',
-                                          usernameVariable: 'CONAN_LOGIN_USERNAME',
-                                          passwordVariable: 'CONAN_PASSWORD')]) {
-          sh '''#!/bin/bash -e
-            export PATH="$HOME/.local/bin:$PATH"
-            conan remote list || true
-            conan user -r "${CONAN_REMOTE}" "${CONAN_LOGIN_USERNAME}" -p "${CONAN_PASSWORD}"
-            conan user -r "${CONAN_REMOTE}"
-          '''
-        }
       }
     }
 
@@ -108,25 +94,24 @@ ${full}"""
     stage('Download Conan Package (Pinned by ID)') {
       steps {
         script {
-          sh 'export PATH="$HOME/.local/bin:$PATH"; conan --version'
-
+          // 1) Use HEAD short hash (same as your example like g84d457c)
           def shortHash = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
           echo "Current commit short hash: ${shortHash}"
 
+          // 2) Find the first matching remote ref (try BoseCorp & bose-corp casing, PR-*)
           def foundRef = sh(
             script: """#!/bin/bash -e
               set -o pipefail
-              export PATH="\$HOME/.local/bin:\$PATH"
               conan search -r "${CONAN_REMOTE}" "AOCPUService/*+g${shortHash}@BoseCorp/PR-*" --raw | head -n1 || true
             """,
             returnStdout: true
           ).trim()
 
           if (!foundRef) {
+            // try lower-case org just in case
             foundRef = sh(
               script: """#!/bin/bash -e
                 set -o pipefail
-                export PATH="\$HOME/.local/bin:\$PATH"
                 conan search -r "${CONAN_REMOTE}" "AOCPUService/*+g${shortHash}@bose-corp/PR-*" --raw | head -n1 || true
               """,
               returnStdout: true
@@ -137,33 +122,35 @@ ${full}"""
             error "No AOCPUService recipe found in '${env.CONAN_REMOTE}' for commit ${shortHash}."
           }
           echo "Pinned Conan reference: ${foundRef}"
-          env.REF = foundRef
 
-          sh '''#!/bin/bash -e
-            export PATH="$HOME/.local/bin:$PATH"
-            conan download -r "${CONAN_REMOTE}" "${REF}"           # recipe
-          '''
+          // 3) Download the recipe first (Conan 1.x; no --all)
+          withEnv(["REF=${foundRef}"]) {
+            sh '''#!/bin/bash -e
+              conan download -r "${CONAN_REMOTE}" "${REF}"
+            '''
+          }
 
+          // 4) Query package IDs and download the first one
           def pkgId = sh(
             script: '''#!/bin/bash -e
               set -o pipefail
-              export PATH="$HOME/.local/bin:$PATH"
               conan search "${REF}" -r "${CONAN_REMOTE}" --raw | awk '/Package_ID/ {print $2; exit}'
             ''',
             returnStdout: true
           ).trim()
 
           if (!pkgId) {
-            error "No binary packages found remotely for ${env.REF}."
+            error "No binary packages found remotely for ${foundRef}."
           }
           echo "Using Package_ID: ${pkgId}"
-          env.CONAN_PKG_ID = pkgId
 
-          sh '''#!/bin/bash -e
-            export PATH="$HOME/.local/bin:$PATH"
-            conan download -r "${CONAN_REMOTE}" "${REF}:${CONAN_PKG_ID}"
-          '''
+          withEnv(["PKG=${pkgId}"]) {
+            sh '''#!/bin/bash -e
+              conan download -r "${CONAN_REMOTE}" "${REF}:${PKG}"
+            '''
+          }
 
+          // 5) Compute v1 cache path safely (no Groovy $ interpolation)
           def refPath = sh(
             script: '''#!/bin/bash -e
               NAME="$(echo "$REF" | cut -d/ -f1)"
@@ -175,8 +162,12 @@ ${full}"""
             returnStdout: true
           ).trim()
 
-          if (!refPath) { error "Failed to compute Conan v1 cache path for ${env.REF}" }
+          if (!refPath) {
+            error "Failed to compute Conan v1 cache path for ${foundRef}"
+          }
+
           env.CONAN_REF_PATH = refPath
+          env.CONAN_PKG_ID   = pkgId
           echo "Local Conan cache path: ${env.CONAN_REF_PATH}"
         }
       }
@@ -185,6 +176,7 @@ ${full}"""
     stage('FW Update: AOCPUService (Pinned)') {
       steps {
         script {
+          // find the AOCPUService binary inside the downloaded package
           def binaryPath = sh(
             script: '''#!/bin/bash -e
               set -o pipefail
@@ -192,10 +184,14 @@ ${full}"""
             ''',
             returnStdout: true
           ).trim()
+
           if (!binaryPath) {
             error "AOCPUService binary not found under ${env.CONAN_REF_PATH}/package/${env.CONAN_PKG_ID}"
           }
+
           echo "Found AOCPUService binary: ${binaryPath}"
+          echo "Flashing to device ${env.DEVICE_ID} ..."
+
           withEnv(["BIN=${binaryPath}"]) {
             sh '''#!/bin/bash -e
               adb -s "${DEVICE_ID}" push "${BIN}" /vendor/bin/AOCPUService
@@ -214,7 +210,9 @@ ${full}"""
           dev_md5=$(adb -s "${DEVICE_ID}" shell 'md5sum /vendor/bin/AOCPUService 2>/dev/null' | awk '{print $1}')
           echo "Host   AOCPUService md5: ${host_md5}"
           echo "Device AOCPUService md5: ${dev_md5}"
-          [ -n "${host_md5}" ] && [ -n "${dev_md5}" ] && [ "${host_md5}" = "${dev_md5}" ]
+          if [ -z "${host_md5}" ] || [ -z "${dev_md5}" ] || [ "${host_md5}" != "${dev_md5}" ]; then
+            echo "ERROR: md5 mismatch (or empty)"; exit 2
+          fi
         '''
       }
     }
@@ -248,7 +246,11 @@ ${full}"""
         }
       }
     }
-    success { echo "Build succeeded: ${env.BUILD_URL}" }
-    failure { echo "Build failed: ${env.BUILD_URL}" }
+    success {
+      echo "Build succeeded: ${env.BUILD_URL}"
+    }
+    failure {
+      echo "Build failed: ${env.BUILD_URL}"
+    }
   }
 }
