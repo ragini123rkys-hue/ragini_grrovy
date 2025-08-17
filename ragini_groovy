@@ -1,0 +1,254 @@
+@Library(['JenkinsConanLibrary']) _
+import JenkinsConan
+def conan = new JenkinsConan(this)
+
+pipeline {
+  agent { label 'LAMARR-FRM-WINFRA-01' }
+
+  options {
+    skipStagesAfterUnstable()
+    disableResume()
+    timeout(time: 4, unit: 'HOURS')
+    timestamps()
+  }
+
+  environment {
+    CONAN_REMOTE = 'liquid'
+    CONAN_USER_HOME = "${WORKSPACE}/ConanHome"
+  }
+
+  stages {
+    stage('Setup Job Environment') {
+      steps {
+        script {
+          echo "Running on branch: ${env.BRANCH_NAME}"
+          echo "CONAN_REMOTE=${env.CONAN_REMOTE}"
+          echo "CONAN_USER_HOME=${env.CONAN_USER_HOME}"
+          echo "WORKSPACE=${env.WORKSPACE}"
+        }
+        checkout scm
+      }
+    }
+
+    stage('Agent Debug') {
+      steps {
+        sh '''#!/bin/bash -e
+          echo "$(hostname)"
+          echo "$(whoami)"
+          echo "PATH: $PATH"
+          which python3 && python3 --version || true
+          which adb && adb version || true
+          echo '--- adb devices ---'
+          adb devices || true
+          echo '--- conan version (pre) ---'
+          which conan && conan --version || echo 'conan not found'
+        '''
+      }
+    }
+
+    stage('Bootstrap Conan') {
+      steps {
+        sh '''#!/bin/bash -e
+          mkdir -p "${CONAN_USER_HOME}"
+
+          # ensure user-local bin is on PATH for this shell AND export it for later stages
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "Ensuring PATH has ~/.local/bin: $PATH"
+
+          if ! command -v conan >/dev/null 2>&1; then
+            echo "Conan not found. Installing Conan 1.x to user site..."
+            python3 -m pip install --user "conan<2"
+          fi
+
+          conan --version
+        '''
+        // login using credentials safely (no Groovy interpolation in env)
+        withCredentials([usernamePassword(credentialsId: 'jenkins_liquid_artifactory',
+                                          usernameVariable: 'CONAN_LOGIN_USERNAME',
+                                          passwordVariable: 'CONAN_PASSWORD')]) {
+          sh '''#!/bin/bash -e
+            export PATH="$HOME/.local/bin:$PATH"
+            conan remote list || true
+            conan user -r "${CONAN_REMOTE}" "${CONAN_LOGIN_USERNAME}" -p "${CONAN_PASSWORD}"
+            conan user -r "${CONAN_REMOTE}"
+          '''
+        }
+      }
+    }
+
+    stage('Select Target Device') {
+      steps {
+        script {
+          echo "Detecting connected devices via adb..."
+          def serial = sh(
+            script: '''#!/bin/bash -e
+              adb start-server >/dev/null 2>&1 || true
+              adb devices | awk 'NR>1 && $2=="device" {print $1; exit}'
+            ''',
+            returnStdout: true
+          ).trim()
+
+          if (!serial) {
+            def full = sh(script: 'adb devices || true', returnStdout: true)
+            error """No suitable DEVICE_ID found.
+Tips:
+- 'adb devices' must show '<serial>\\tdevice' (not offline/unauthorized)
+- If unauthorized: unlock DUT and accept the RSA fingerprint dialog
+- If using TCP/IP: run 'adb connect <ip:port>' before the job
+Full adb output:
+${full}"""
+          }
+
+          env.DEVICE_ID = serial
+          echo "Using DEVICE_ID: ${env.DEVICE_ID}"
+        }
+      }
+    }
+
+    stage('Download Conan Package (Pinned by ID)') {
+      steps {
+        script {
+          sh 'export PATH="$HOME/.local/bin:$PATH"; conan --version'
+
+          def shortHash = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+          echo "Current commit short hash: ${shortHash}"
+
+          def foundRef = sh(
+            script: """#!/bin/bash -e
+              set -o pipefail
+              export PATH="\$HOME/.local/bin:\$PATH"
+              conan search -r "${CONAN_REMOTE}" "AOCPUService/*+g${shortHash}@BoseCorp/PR-*" --raw | head -n1 || true
+            """,
+            returnStdout: true
+          ).trim()
+
+          if (!foundRef) {
+            foundRef = sh(
+              script: """#!/bin/bash -e
+                set -o pipefail
+                export PATH="\$HOME/.local/bin:\$PATH"
+                conan search -r "${CONAN_REMOTE}" "AOCPUService/*+g${shortHash}@bose-corp/PR-*" --raw | head -n1 || true
+              """,
+              returnStdout: true
+            ).trim()
+          }
+
+          if (!foundRef) {
+            error "No AOCPUService recipe found in '${env.CONAN_REMOTE}' for commit ${shortHash}."
+          }
+          echo "Pinned Conan reference: ${foundRef}"
+          env.REF = foundRef
+
+          sh '''#!/bin/bash -e
+            export PATH="$HOME/.local/bin:$PATH"
+            conan download -r "${CONAN_REMOTE}" "${REF}"           # recipe
+          '''
+
+          def pkgId = sh(
+            script: '''#!/bin/bash -e
+              set -o pipefail
+              export PATH="$HOME/.local/bin:$PATH"
+              conan search "${REF}" -r "${CONAN_REMOTE}" --raw | awk '/Package_ID/ {print $2; exit}'
+            ''',
+            returnStdout: true
+          ).trim()
+
+          if (!pkgId) {
+            error "No binary packages found remotely for ${env.REF}."
+          }
+          echo "Using Package_ID: ${pkgId}"
+          env.CONAN_PKG_ID = pkgId
+
+          sh '''#!/bin/bash -e
+            export PATH="$HOME/.local/bin:$PATH"
+            conan download -r "${CONAN_REMOTE}" "${REF}:${CONAN_PKG_ID}"
+          '''
+
+          def refPath = sh(
+            script: '''#!/bin/bash -e
+              NAME="$(echo "$REF" | cut -d/ -f1)"
+              VER="$(echo "$REF" | cut -d/ -f2 | cut -d@ -f1)"
+              USER="$(echo "$REF" | cut -d@ -f2 | cut -d/ -f1)"
+              CHAN="$(echo "$REF" | cut -d/ -f3)"
+              echo "${CONAN_USER_HOME}/.conan/data/${NAME}/${VER}/${USER}/${CHAN}"
+            ''',
+            returnStdout: true
+          ).trim()
+
+          if (!refPath) { error "Failed to compute Conan v1 cache path for ${env.REF}" }
+          env.CONAN_REF_PATH = refPath
+          echo "Local Conan cache path: ${env.CONAN_REF_PATH}"
+        }
+      }
+    }
+
+    stage('FW Update: AOCPUService (Pinned)') {
+      steps {
+        script {
+          def binaryPath = sh(
+            script: '''#!/bin/bash -e
+              set -o pipefail
+              find "${CONAN_REF_PATH}/package/${CONAN_PKG_ID}" -type f -name 'AOCPUService' | head -n1
+            ''',
+            returnStdout: true
+          ).trim()
+          if (!binaryPath) {
+            error "AOCPUService binary not found under ${env.CONAN_REF_PATH}/package/${env.CONAN_PKG_ID}"
+          }
+          echo "Found AOCPUService binary: ${binaryPath}"
+          withEnv(["BIN=${binaryPath}"]) {
+            sh '''#!/bin/bash -e
+              adb -s "${DEVICE_ID}" push "${BIN}" /vendor/bin/AOCPUService
+              adb -s "${DEVICE_ID}" shell chmod +x /vendor/bin/AOCPUService
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Verify AOCPUService on Device (hash)') {
+      steps {
+        sh '''#!/bin/bash -e
+          set -o pipefail
+          host_md5=$(md5sum "${CONAN_REF_PATH}/package/${CONAN_PKG_ID}"/**/AOCPUService 2>/dev/null | head -n1 | awk '{print $1}')
+          dev_md5=$(adb -s "${DEVICE_ID}" shell 'md5sum /vendor/bin/AOCPUService 2>/dev/null' | awk '{print $1}')
+          echo "Host   AOCPUService md5: ${host_md5}"
+          echo "Device AOCPUService md5: ${dev_md5}"
+          [ -n "${host_md5}" ] && [ -n "${dev_md5}" ] && [ "${host_md5}" = "${dev_md5}" ]
+        '''
+      }
+    }
+
+    stage('Run Unit Tests') {
+      steps {
+        sh '''#!/bin/bash -e
+          cd "${WORKSPACE}"
+          if [ -x ./ccx ]; then
+            ./ccx
+          else
+            echo "WARN: ./ccx not found or not executable; skipping unit tests."
+          fi
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      sh '''#!/bin/bash
+        echo '--- post-run adb devices ---'
+        adb devices || true
+      '''
+      script {
+        try {
+          archiveArtifacts allowEmptyArchive: true, artifacts: "tests/integration/output.xml, tests/integration/*.png"
+          junit "tests/integration/output.xml"
+        } catch(e) {
+          echo 'Artifact/JUnit publish skipped or failed: ' + e.getMessage()
+        }
+      }
+    }
+    success { echo "Build succeeded: ${env.BUILD_URL}" }
+    failure { echo "Build failed: ${env.BUILD_URL}" }
+  }
+}
